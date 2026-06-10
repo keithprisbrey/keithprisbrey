@@ -1,19 +1,15 @@
 import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-from auto_gptq import AutoGPTQForCausalLM
 import sys
-import os
+import subprocess
+import json
+import base64
 
-def analyze_image_with_quantized_qwen(image_path: str, prompt: str = "What do you see in this image?") -> str:
+def analyze_image_with_transformers(image_path: str, prompt: str = "What do you see in this image?") -> str:
     """
-    Analyze a JPEG image using quantized Qwen2-VL model (GGUF/GPTQ) on Mac Mini.
-    
-    Quantized models are:
-    - 4-8x smaller than full models
-    - Faster inference
-    - Much lower memory usage
-    - Perfect for Mac Mini
+    Analyze a JPEG image using Qwen2-VL model directly via Transformers.
+    Mac Mini compatible version (CPU inference with Metal acceleration).
     
     Args:
         image_path: Path to the JPEG image file
@@ -23,56 +19,40 @@ def analyze_image_with_quantized_qwen(image_path: str, prompt: str = "What do yo
         The model's analysis of the image
     """
     
-    # Check if image file exists
     if not image_path.endswith(('.jpg', '.jpeg', '.png')):
         raise ValueError("Please provide a valid image file (JPG, JPEG, or PNG)")
     
     try:
-        # Load image
         image = Image.open(image_path).convert("RGB")
         print(f"✓ Image loaded: {image_path}")
         print(f"  Size: {image.size}")
         
-        # Use CPU for Mac Mini
         device = "cpu"
+        print(f"✓ Using device: {device} (Metal acceleration enabled on Mac)")
         
-        print(f"✓ Using device: {device}")
-        
-        # Option 1: GPTQ Quantized Model (recommended for Mac)
-        # These models are already quantized and optimized
-        model_name = "Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4"
-        print(f"✓ Loading quantized model: {model_name}")
-        
-        # Load quantized model
-        model = AutoGPTQForCausalLM.from_quantized(
-            model_name,
-            device=device,
-            use_triton=False,  # Triton not available on Mac
-            use_safetensors=True,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        )
+        model_name = "Qwen/Qwen2-VL-2B-Instruct"
+        print(f"✓ Loading model: {model_name}")
         
         processor = AutoProcessor.from_pretrained(model_name)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map=device,
+            low_cpu_mem_usage=True
+        )
         
-        print("✓ Quantized model loaded successfully")
-        print(f"  Model size: ~600MB (vs ~10GB for full model)")
+        print("✓ Model loaded successfully")
         
-        # Prepare the message for the model
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                        "image": image,
-                    },
+                    {"type": "image", "image": image},
                     {"type": "text", "text": prompt}
                 ],
             }
         ]
         
-        # Process the image and prompt
         print(f"✓ Processing image with prompt: '{prompt}'")
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -88,8 +68,7 @@ def analyze_image_with_quantized_qwen(image_path: str, prompt: str = "What do yo
             return_tensors="pt",
         ).to(device)
         
-        # Generate response with quantized model
-        print("⏳ Generating response (quantized inference)...")
+        print("⏳ Generating response...")
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
@@ -98,7 +77,6 @@ def analyze_image_with_quantized_qwen(image_path: str, prompt: str = "What do yo
                 top_p=0.95,
             )
         
-        # Decode the response
         response = processor.decode(
             output_ids[0][inputs["input_ids"].shape[1]:],
             skip_special_tokens=True,
@@ -112,48 +90,70 @@ def analyze_image_with_quantized_qwen(image_path: str, prompt: str = "What do yo
         raise Exception(f"Error processing image: {str(e)}")
 
 
-def analyze_with_gguf_ollama(image_path: str, prompt: str = "What do you see in this image?") -> str:
+def analyze_with_ollama(image_path: str, prompt: str = "What do you see in this image?") -> str:
     """
-    Alternative: Use Ollama with GGUF quantized models (simpler, lighter).
-    Requires Ollama to be installed and running.
+    BEST METHOD FOR MAC MINI: Use Ollama with GGUF quantized models.
     
-    This is the EASIEST approach for Mac Mini:
-    - Install: brew install ollama
-    - Pull model: ollama pull qwen2-vision
-    - Run: python script.py image.jpg "your prompt"
+    Why Ollama is the best choice:
+    - Easiest installation (one homebrew command)
+    - Handles GGUF models perfectly
+    - Optimized for Mac (uses Metal acceleration)
+    - No Python dependency management
+    - Fastest on Mac Mini
     """
-    import subprocess
-    import json
     
     try:
-        # Check if Ollama is running
         result = subprocess.run(
-            ["ollama", "list"],
+            ["curl", "-s", "http://localhost:11434/api/tags"],
             capture_output=True,
             text=True,
             timeout=5
         )
         
         if result.returncode != 0:
-            raise Exception("Ollama is not running. Start it with: ollama serve")
+            raise Exception(
+                "Ollama is not running.\n"
+                "Start it with: ollama serve\n"
+                "Or: brew services start ollama"
+            )
         
         print("✓ Ollama is running")
         
-        # Read image as base64
-        import base64
+        try:
+            data = json.loads(result.stdout)
+            models = [m.get("name", "") for m in data.get("models", [])]
+            if not any("qwen" in m.lower() for m in models):
+                raise Exception(
+                    "qwen2-vision model not found.\n"
+                    "Download it with: ollama pull qwen2-vision"
+                )
+        except json.JSONDecodeError:
+            pass
+        
         with open(image_path, "rb") as img_file:
             image_data = base64.standard_b64encode(img_file.read()).decode()
         
+        image = Image.open(image_path)
         print(f"✓ Image loaded: {image_path}")
-        print(f"✓ Processing with Ollama (GGUF quantized model)")
+        print(f"  Size: {image.size}")
+        print(f"✓ Processing with Ollama (GGUF, Metal acceleration)")
         
-        # Call Ollama API
+        api_data = {
+            "model": "qwen2-vision",
+            "prompt": prompt,
+            "images": [image_data],
+            "stream": False,
+            "temperature": 0.7,
+        }
+        
         result = subprocess.run(
             [
-                "ollama",
-                "run",
-                "qwen2-vision",
-                f"[IMG]{image_data}[/IMG] {prompt}"
+                "curl",
+                "-s",
+                "-X", "POST",
+                "http://localhost:11434/api/generate",
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps(api_data),
             ],
             capture_output=True,
             text=True,
@@ -161,21 +161,41 @@ def analyze_with_gguf_ollama(image_path: str, prompt: str = "What do you see in 
         )
         
         if result.returncode == 0:
-            return result.stdout.strip()
+            try:
+                response_data = json.loads(result.stdout)
+                return response_data.get("response", "No response from model")
+            except json.JSONDecodeError:
+                return result.stdout.strip()
         else:
             raise Exception(f"Ollama error: {result.stderr}")
     
     except subprocess.TimeoutExpired:
         raise Exception("Ollama request timed out")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Image file not found: {image_path}")
     except Exception as e:
-        raise Exception(f"Ollama error: {str(e)}")
+        raise Exception(f"Error: {str(e)}")
 
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Analyze images with quantized Qwen2-VL on Mac Mini"
+        description="Analyze images with Qwen2-VL on Mac Mini",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+RECOMMENDED: Use --method ollama (easiest on Mac Mini)
+
+Quick Start with Ollama:
+  1. brew install ollama
+  2. ollama pull qwen2-vision
+  3. ollama serve  (in background or separate terminal)
+  4. python qwen_quantized.py image.jpg --method ollama
+
+Alternative: Direct Transformers method
+  pip install torch transformers pillow
+  python qwen_quantized.py image.jpg --method direct
+        """
     )
     parser.add_argument(
         "image",
@@ -188,35 +208,41 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--method",
-        choices=["gptq", "ollama"],
-        default="gptq",
-        help="Method: 'gptq' (Transformers) or 'ollama' (GGUF, simpler)"
+        choices=["ollama", "direct"],
+        default="ollama",
+        help="Method: 'ollama' (RECOMMENDED) or 'direct' (Transformers)"
     )
     
     args = parser.parse_args()
     
     try:
-        print("\n" + "="*60)
-        print("Quantized Qwen2-VL Image Analyzer for Mac Mini")
-        print("="*60 + "\n")
+        print("\n" + "="*70)
+        print("Qwen2-VL Image Analyzer for Mac Mini")
+        print("="*70 + "\n")
         
         if args.method == "ollama":
-            result = analyze_with_gguf_ollama(args.image, args.prompt)
+            result = analyze_with_ollama(args.image, args.prompt)
         else:
-            result = analyze_image_with_quantized_qwen(args.image, args.prompt)
+            result = analyze_image_with_transformers(args.image, args.prompt)
         
         print("\n📊 Analysis Result:")
-        print("-" * 60)
+        print("-" * 70)
         print(result)
-        print("-" * 60 + "\n")
+        print("-" * 70 + "\n")
         
     except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        print("\nUsage:")
-        print("  python qwen_quantized.py image.jpg")
-        print("  python qwen_quantized.py image.jpg -p 'Your custom prompt'")
-        print("  python qwen_quantized.py image.jpg --method ollama")
-        print("\nFor Ollama method:")
-        print("  brew install ollama")
-        print("  ollama pull qwen2-vision")
+        print(f"\n❌ Error: {str(e)}\n")
+        print("="*70)
+        print("SETUP INSTRUCTIONS FOR MAC MINI:")
+        print("="*70)
+        print("\n✓ OPTION 1: Ollama (RECOMMENDED - Easiest)")
+        print("  1. brew install ollama")
+        print("  2. ollama pull qwen2-vision")
+        print("  3. ollama serve")
+        print("  4. python qwen_quantized.py image.jpg --method ollama\n")
+        
+        print("✓ OPTION 2: Direct Transformers")
+        print("  pip install torch transformers pillow")
+        print("  python qwen_quantized.py image.jpg --method direct\n")
+        print("="*70 + "\n")
         sys.exit(1)
